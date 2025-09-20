@@ -14,6 +14,7 @@ import { parseDateRangeFlexible } from './dates.js';
 import { prisma, getOrCreateUser } from './db.js';
 import { getUI, setUI, resetUI, pushScreen, popScreen } from './state.js';
 import { friendlyReply } from './llm.js';
+import { recommendForUser } from './recs.js';
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -373,6 +374,45 @@ bot.command('profile_raw', async (ctx) => {
   });
 });
 
+bot.command('recs', async (ctx) => {
+  const userId = String(ctx.from.id);
+  await spinnerStart(ctx, userId);
+  try {
+    const { items, meta } = await recommendForUser(userId, 5);
+    if (!items.length) {
+      await ctx.reply('Пока ничего подходящего не нашёл. Попробуй уточнить вкусы или даты.');
+      return;
+    }
+    const headline = `Подборка для ${[meta.city, meta.country].filter(Boolean).join(', ') || 'твоей поездки'} ${
+      meta.start ? `с ${meta.start.slice(0, 10)}` : ''
+    } ${meta.end ? `по ${meta.end.slice(0, 10)}` : ''}`.replace(/\s+/g, ' ').trim();
+    await ctx.reply(headline);
+    for (const rec of items) {
+      const when = rec.start ? rec.start.slice(0, 16).replace('T', ' ') : 'Дата уточняется';
+      const venueLine = [rec.venue?.name, rec.venue?.city, rec.venue?.country]
+        .filter(Boolean)
+        .join(', ');
+      const priceLine = rec.priceFrom ? `от ${rec.priceFrom} ${rec.priceCurrency || ''}` : '';
+      const text = `• *${rec.title}* (${rec.category})\n${venueLine}\n${when}${priceLine ? `\n${priceLine}` : ''}`;
+      await ctx.reply(text, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [
+            rec.url
+              ? Markup.button.url('Ссылка', rec.url)
+              : Markup.button.callback('Нет ссылки', 'noop')
+          ]
+        ])
+      });
+    }
+  } catch (error) {
+    console.error('/recs command error', error);
+    await ctx.reply('Не получилось собрать подборку. Попробуй позже.');
+  } finally {
+    await spinnerStop(ctx, userId);
+  }
+});
+
 bot.on('callback_query', async (ctx) => {
   const userRecord = await getOrCreateUser(ctx.from);
   const tgId = userRecord.id;
@@ -381,6 +421,10 @@ bot.on('callback_query', async (ctx) => {
   try {
     await ctx.answerCbQuery();
   } catch {}
+
+  if (data === 'noop') {
+    return;
+  }
 
   if (data === 'edit:location') {
     await prisma.user.update({ where: { id: tgId }, data: { step: 'edit_location' } });
@@ -990,6 +1034,22 @@ app.get('/api/users/:id/raw', async (req, res) => {
     cinemaRaw: user.cinemaRaw ?? null,
     budget: user.budget ?? null
   });
+});
+
+app.get('/api/recs', async (req, res) => {
+  const userId = String(req.query.userId || '');
+  if (!userId) {
+    res.status(400).json({ error: 'userId_required' });
+    return;
+  }
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '20', 10), 1), 50);
+  try {
+    const result = await recommendForUser(userId, limit);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    console.error('GET /api/recs error', error);
+    res.status(500).json({ ok: false, error: 'failed' });
+  }
 });
 
 app.get('/health', (_req, res) => {
