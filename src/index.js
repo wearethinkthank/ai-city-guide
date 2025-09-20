@@ -28,21 +28,29 @@ app.use(express.json());
 const bot = new Telegraf(token);
 
 const tgLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 120,
+  windowMs: 60_000,
+  limit: 1000,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.headers['x-forwarded-for'] || req.ip
+  keyGenerator: (req) => req.headers['x-forwarded-for'] || req.ip,
+  skip: (req) => {
+    const expected = process.env.TG_WEBHOOK_SECRET;
+    const got = req.header('x-telegram-bot-api-secret-token');
+    return Boolean(expected && got === expected);
+  }
 });
 
-function verifyTelegramSecret(req, res, next) {
+app.use('/telegram', (req, res, next) => {
+  if (req.method !== 'POST') {
+    return res.status(200).end();
+  }
   const expected = process.env.TG_WEBHOOK_SECRET;
   if (!expected) return next();
   const got = req.header('x-telegram-bot-api-secret-token');
-  if (got && got === expected) return next();
+  if (got === expected) return next();
   console.warn('[webhook] secret mismatch');
   return res.status(200).end();
-}
+});
 
 app.use('/telegram', (req, _res, next) => {
   console.log('[webhook] hit', req.method, 'len=', req.headers['content-length'] || 0);
@@ -50,7 +58,6 @@ app.use('/telegram', (req, _res, next) => {
 });
 
 app.use('/telegram', tgLimiter);
-app.use('/telegram', verifyTelegramSecret);
 app.use('/telegram', bot.webhookCallback());
 
 // --- Telegram Webhook helpers ---
