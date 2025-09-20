@@ -1,6 +1,7 @@
 import 'dotenv/config';
 
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { Markup, Telegraf } from 'telegraf';
 import {
   normalizeMusic,
@@ -26,15 +27,31 @@ app.use(express.json());
 
 const bot = new Telegraf(token);
 
-// Always mount webhook route for visibility and safety
+const tgLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.headers['x-forwarded-for'] || req.ip
+});
+
+function verifyTelegramSecret(req, res, next) {
+  const expected = process.env.TG_WEBHOOK_SECRET;
+  if (!expected) return next();
+  const got = req.get('X-Telegram-Bot-Api-Secret-Token');
+  if (got && got === expected) return next();
+  console.warn('[webhook] secret mismatch');
+  return res.status(200).end();
+}
+
 app.use('/telegram', (req, _res, next) => {
-  console.log('[webhook] hit', req.method, req.path);
+  console.log('[webhook] hit', req.method, 'len=', req.headers['content-length'] || 0);
   next();
 });
 
-app.use(express.json());
-// путь указываем ТОЛЬКО Telegraf’у:
-app.use(bot.webhookCallback('/telegram'));  // ✅
+app.use('/telegram', tgLimiter);
+app.use('/telegram', verifyTelegramSecret);
+app.use('/telegram', bot.webhookCallback());
 
 // --- Telegram Webhook helpers ---
 async function getWebhookInfo(botToken) {
@@ -43,12 +60,16 @@ async function getWebhookInfo(botToken) {
 }
 
 async function setWebhook(botToken, url) {
+  const body = {
+    url,
+    secret_token: process.env.TG_WEBHOOK_SECRET || undefined,
+    max_connections: 40,
+    allowed_updates: ['message', 'callback_query']
+  };
   const res = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      url
-    })
+    body: JSON.stringify(body)
   });
   return res.json();
 }
@@ -93,6 +114,10 @@ async function setupCommands(botInstance) {
 }
 
 setupCommands(bot);
+
+bot.catch((err, ctx) => {
+  console.error('[telegraf] error', err?.stack || err, 'on update', ctx?.update?.update_id);
+});
 
 async function deletePrevPrompt(ctx, userId) {
   const ui = getUI(userId);
@@ -970,7 +995,11 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/healthz', (_req, res) => {
-  res.json({ ok: true, mode: process.env.WEBHOOK_URL ? 'webhook' : 'polling' });
+  res.json({
+    ok: true,
+    mode: process.env.WEBHOOK_URL ? 'webhook' : 'polling',
+    webhookSecret: Boolean(process.env.TG_WEBHOOK_SECRET)
+  });
 });
 
 app.get('/ready', async (_req, res) => {
@@ -979,6 +1008,20 @@ app.get('/ready', async (_req, res) => {
     res.json({ ok: true });
   } catch (error) {
     res.status(500).json({ ok: false, error: 'db_not_ready' });
+  }
+});
+
+app.get('/api/diag/webhook', async (_req, res) => {
+  try {
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) {
+      res.status(400).json({ error: 'no_token' });
+      return;
+    }
+    const info = await getWebhookInfo(botToken);
+    res.json({ ok: true, info });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: String(error) });
   }
 });
 
