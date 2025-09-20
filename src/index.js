@@ -26,6 +26,14 @@ app.use(express.json());
 
 const bot = new Telegraf(token);
 
+// Always mount webhook route for visibility and safety
+app.use('/telegram', (req, _res, next) => {
+  console.log('[webhook] hit', req.method, req.path);
+  next();
+});
+
+app.use('/telegram', bot.webhookCallback('/telegram'));
+
 // --- Telegram Webhook helpers ---
 async function getWebhookInfo(botToken) {
   const res = await fetch(`https://api.telegram.org/bot${botToken}/getWebhookInfo`);
@@ -43,7 +51,7 @@ async function setWebhook(botToken, url) {
   return res.json();
 }
 
-async function ensureWebhook(botInstance, expressApp) {
+async function ensureWebhook(botInstance, _expressApp) {
   const url = process.env.WEBHOOK_URL;
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!url || !botToken) {
@@ -52,8 +60,6 @@ async function ensureWebhook(botInstance, expressApp) {
     console.log('[bot] launched with long polling');
     return;
   }
-
-  expressApp.use('/telegram', botInstance.webhookCallback('/telegram'));
 
   try {
     const info = await getWebhookInfo(botToken);
