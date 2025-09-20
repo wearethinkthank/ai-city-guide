@@ -38,7 +38,7 @@ const tgLimiter = rateLimit({
 function verifyTelegramSecret(req, res, next) {
   const expected = process.env.TG_WEBHOOK_SECRET;
   if (!expected) return next();
-  const got = req.get('X-Telegram-Bot-Api-Secret-Token');
+  const got = req.header('x-telegram-bot-api-secret-token');
   if (got && got === expected) return next();
   console.warn('[webhook] secret mismatch');
   return res.status(200).end();
@@ -74,7 +74,7 @@ async function setWebhook(botToken, url) {
   return res.json();
 }
 
-async function ensureWebhook(botInstance, _expressApp) {
+async function ensureWebhook(botInstance) {
   const url = process.env.WEBHOOK_URL;
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!url || !botToken) {
@@ -85,15 +85,10 @@ async function ensureWebhook(botInstance, _expressApp) {
   }
 
   try {
-    const info = await getWebhookInfo(botToken);
-    const current = info?.result?.url || info?.url || info?.result?.hook || '';
-    if (current !== url) {
-      console.log('[webhook] different or empty, setting new webhook...');
-      const resp = await setWebhook(botToken, url);
-      console.log('[webhook] setWebhook response:', resp);
-    } else {
-      console.log('[webhook] already set to correct URL');
-    }
+    await getWebhookInfo(botToken); // just to log? still useful maybe
+    console.log('[webhook] setting webhook (force) ...');
+    const resp = await setWebhook(botToken, url);
+    console.log('[webhook] setWebhook response:', resp);
   } catch (error) {
     console.error('[webhook] ensure error:', error);
   }
@@ -1028,7 +1023,7 @@ app.get('/api/diag/webhook', async (_req, res) => {
 const port = process.env.PORT || 8080;
 app.listen(port, async () => {
   console.log(`HTTP on :${port}`);
-  await ensureWebhook(bot, app);
+  await ensureWebhook(bot);
 });
 
 process.once('SIGINT', () => {
