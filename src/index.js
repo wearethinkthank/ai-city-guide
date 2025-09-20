@@ -32,7 +32,9 @@ app.use('/telegram', (req, _res, next) => {
   next();
 });
 
-app.use('/telegram', bot.webhookCallback('/telegram'));
+app.use(express.json());
+// путь указываем ТОЛЬКО Telegraf’у:
+app.use(bot.webhookCallback('/telegram'));  // ✅
 
 // --- Telegram Webhook helpers ---
 async function getWebhookInfo(botToken) {
