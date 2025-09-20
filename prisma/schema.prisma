@@ -1,0 +1,37 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String   @id
+  step        String   @default("dest")
+
+  destination String?
+  country     String?
+  city        String?
+
+  dates       Json?
+  budget      String?
+
+  music       Json?
+  cuisine     Json?
+  art         Json?
+  cinema      Json?
+
+  musicRaw    String?
+  cuisineRaw  String?
+  artRaw      String?
+  cinemaRaw   String?
+
+  username    String?
+  firstName   String?
+  lastName    String?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
