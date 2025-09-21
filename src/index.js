@@ -9,7 +9,7 @@ import {
   normalizeArt,
   normalizeCinema
 } from './normalize.js';
-import { normalizeLocation, validateGeo } from './location.js';
+import { normalizeLocation, validateGeo, resolveLocationFreeform } from './location.js';
 import { parseDateRangeFlexible } from './dates.js';
 import { prisma, getOrCreateUser } from './db.js';
 import { getUI, setUI, resetUI, pushScreen, popScreen } from './state.js';
@@ -711,58 +711,38 @@ bot.on('text', async (ctx) => {
     await deletePrevPrompt(ctx, userRecord.id);
     await spinnerStart(ctx, userRecord.id);
     try {
-      const loc = await normalizeLocation(text);
-      const city = loc.city || null;
-      const country = loc.country || null;
-
-      if (loc.needsCity && country) {
+      const out = await resolveLocationFreeform(text);
+      if (out.status === 'ok') {
+        const destination = `${out.city}, ${out.country}`;
         await prisma.user.update({
           where: { id: userRecord.id },
-          data: { country, city: null, destination: null, step: 'dest_city' }
+          data: { city: out.city, country: out.country, destination, step: 'dates' }
         });
-        await spinnerStop(ctx, userRecord.id);
-        await ask(ctx, userRecord.id, `Ок, страна "${country}". А какой город?`);
-        return;
-      }
-
-      if (loc.needsCountry && city) {
-        await prisma.user.update({
-          where: { id: userRecord.id },
-          data: { city, country: null, destination: null, step: 'dest_country' }
-        });
-        await spinnerStop(ctx, userRecord.id);
-        await ask(ctx, userRecord.id, `Ок, город "${city}". Уточни страну, пожалуйста.`);
-        return;
-      }
-
-      const validation = await validateGeo(city, country);
-      const ok = validation.isCityValid && validation.isCountryValid && validation.confidence >= 0.6;
-
-      if (!ok) {
-        await prisma.user.update({ where: { id: userRecord.id }, data: { step: 'dest' } });
         await spinnerStop(ctx, userRecord.id);
         await ask(
           ctx,
           userRecord.id,
-          'Не уверен в локации. Укажи ещё раз город и страну, например: "Porto, Portugal"'
+          `Принял: ${destination}. Теперь даты поездки? (например, 2025-10-01 — 2025-10-07)`
         );
         return;
       }
 
-      const finalCity = validation.cityCanonical || city;
-      const finalCountry = validation.countryCanonical || country;
-      const destination = `${finalCity}, ${finalCountry}`;
+      if (out.status === 'need_city') {
+        await prisma.user.update({
+          where: { id: userRecord.id },
+          data: { country: out.country || null, step: 'dest_city_only' }
+        });
+        await spinnerStop(ctx, userRecord.id);
+        await ask(ctx, userRecord.id, out.message || 'Ок, страна принята. Какой город?');
+        return;
+      }
 
-      await prisma.user.update({
-        where: { id: userRecord.id },
-        data: { city: finalCity, country: finalCountry, destination, step: 'dates' }
-      });
-
+      await prisma.user.update({ where: { id: userRecord.id }, data: { step: 'dest' } });
       await spinnerStop(ctx, userRecord.id);
       await ask(
         ctx,
         userRecord.id,
-        `Принял: ${destination}. Теперь даты поездки? (например, 2025-10-01 — 2025-10-07)`
+        out.message || 'Не понял локацию. Напиши в формате "Город, Страна".'
       );
       return;
     } catch (error) {
@@ -773,74 +753,62 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  if (step === 'dest_city') {
+  if (step === 'dest_city_only' || step === 'dest_city') {
     await deletePrevPrompt(ctx, userRecord.id);
     await spinnerStart(ctx, userRecord.id);
     try {
-      const guess = await normalizeLocation(`${text}, ${user.country ?? ''}`);
-      const city = guess.city || text;
-      const country = user.country || guess.country || null;
-
-      const validation = await validateGeo(city, country);
-      const ok = validation.isCityValid && validation.isCountryValid && validation.confidence >= 0.6;
-
-      if (!ok) {
+      const out = await resolveLocationFreeform(`${text}, ${user.country || ''}`, user.country || null, null);
+      if (out.status === 'ok') {
+        const destination = `${out.city}, ${out.country}`;
+        await prisma.user.update({
+          where: { id: userRecord.id },
+          data: { city: out.city, country: out.country, destination, step: 'dates' }
+        });
         await spinnerStop(ctx, userRecord.id);
-        await ask(ctx, userRecord.id, 'Не совсем понял город. Укажи ещё раз в формате "Город, Страна".');
+        await ask(ctx, userRecord.id, `Ок, ${destination}. Теперь даты поездки?`);
         return;
       }
 
-      const finalCity = validation.cityCanonical || city;
-      const finalCountry = validation.countryCanonical || country;
-      const destination = `${finalCity}, ${finalCountry}`;
-
-      await prisma.user.update({
-        where: { id: userRecord.id },
-        data: { city: finalCity, country: finalCountry, destination, step: 'dates' }
-      });
-
       await spinnerStop(ctx, userRecord.id);
-      await ask(ctx, userRecord.id, `Ок, ${destination}. Теперь даты поездки?`);
+      if (out.status === 'need_city') {
+        await ask(ctx, userRecord.id, out.message || 'Укажи, пожалуйста, город.');
+      } else {
+        await ask(ctx, userRecord.id, out.message || 'Не понял город. Напиши его ещё раз.');
+      }
       return;
     } catch (error) {
-      console.error('[dest_city] error', error);
+      console.error('[dest_city_only] error', error);
       await spinnerStop(ctx, userRecord.id);
       await ask(ctx, userRecord.id, 'Не получилось. Укажи "Город, Страна".');
       return;
     }
   }
 
-  if (step === 'dest_country') {
+  if (step === 'dest_country_only' || step === 'dest_country') {
     await deletePrevPrompt(ctx, userRecord.id);
     await spinnerStart(ctx, userRecord.id);
     try {
-      const guess = await normalizeLocation(`${user.city ?? ''}, ${text}`);
-      const city = user.city || guess.city || null;
-      const country = guess.country || text;
-
-      const validation = await validateGeo(city, country);
-      const ok = validation.isCityValid && validation.isCountryValid && validation.confidence >= 0.6;
-
-      if (!ok) {
+      const out = await resolveLocationFreeform(`${user.city || ''}, ${text}`, null, user.city || null);
+      if (out.status === 'ok') {
+        const destination = `${out.city}, ${out.country}`;
+        await prisma.user.update({
+          where: { id: userRecord.id },
+          data: { city: out.city, country: out.country, destination, step: 'dates' }
+        });
         await spinnerStop(ctx, userRecord.id);
-        await ask(ctx, userRecord.id, 'Страну не распознал. Повтори, пожалуйста: "Город, Страна".');
+        await ask(ctx, userRecord.id, `Супер, ${destination}. Введи даты поездки.`);
         return;
       }
 
-      const finalCity = validation.cityCanonical || city;
-      const finalCountry = validation.countryCanonical || country;
-      const destination = `${finalCity}, ${finalCountry}`;
-
-      await prisma.user.update({
-        where: { id: userRecord.id },
-        data: { city: finalCity, country: finalCountry, destination, step: 'dates' }
-      });
-
       await spinnerStop(ctx, userRecord.id);
-      await ask(ctx, userRecord.id, `Супер, ${destination}. Введи даты поездки.`);
+      await ask(
+        ctx,
+        userRecord.id,
+        out.message || 'Страну не распознал. Повтори, пожалуйста: "Город, Страна".'
+      );
       return;
     } catch (error) {
-      console.error('[dest_country] error', error);
+      console.error('[dest_country_only] error', error);
       await spinnerStop(ctx, userRecord.id);
       await ask(ctx, userRecord.id, 'Не получилось. Укажи "Город, Страна".');
       return;

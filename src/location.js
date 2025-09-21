@@ -1,26 +1,30 @@
 import OpenAI from 'openai';
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-const SYSTEM = `
-You are a location normalizer. Task: infer CITY and COUNTRY from a free-text user input.
-Return STRICT JSON:
-
-{
-  "city": string|null,        // English or widely used Latin transliteration
-  "country": string|null,     // English country name
-  "confidence": number,       // 0..1
-  "needsCity": boolean,       // true if only country detected or city ambiguous
-  "needsCountry": boolean,    // true if only city detected or country ambiguous
-  "normalized": string|null,  // e.g. "Berlin, Germany" if both known
-  "note": string|null         // short reasoning or disambiguation hint
+let client;
+function getClient() {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+  if (!client) client = new OpenAI({ apiKey });
+  return client;
 }
 
+const NORMALIZER_SYS = `
+You are a location normalizer. Task: infer CITY and COUNTRY from a free-text user input.
+Return STRICT JSON:
+{
+  "city": string|null,
+  "country": string|null,
+  "confidence": number,
+  "needsCity": boolean,
+  "needsCountry": boolean,
+  "normalized": string|null,
+  "note": string|null
+}
 Rules:
 - Fix typos (e.g., "Amstrdam" -> "Amsterdam").
 - If user gives only country: set needsCity=true.
-- If user gives only city: infer most common country; if ambiguous (e.g., "Springfield"), set needsCountry=true.
-- Use well-known exonyms (e.g., "Moscow, Russia", "Kyiv, Ukraine", "New York, United States").
+- If user gives only city: infer most common country; if ambiguous set needsCountry=true.
+- Use well-known exonyms ("Moscow, Russia", "Kyiv, Ukraine", ...).
 - Never add extra fields; return ONLY valid JSON.
 `;
 
@@ -34,7 +38,8 @@ function strip(raw) {
 }
 
 export async function normalizeLocation(rawText) {
-  if (!process.env.OPENAI_API_KEY) {
+  const cli = getClient();
+  if (!cli) {
     const t = (rawText || '').trim();
     return {
       city: t || null,
@@ -43,21 +48,20 @@ export async function normalizeLocation(rawText) {
       needsCity: false,
       needsCountry: true,
       normalized: t || null,
-      note: 'No OpenAI key, simple passthrough.'
+      note: 'fallback_no_llm'
     };
   }
 
-  const resp = await client.chat.completions.create({
+  const resp = await cli.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0,
     messages: [
-      { role: 'system', content: SYSTEM },
+      { role: 'system', content: NORMALIZER_SYS },
       { role: 'user', content: `User input: ${rawText}` }
     ]
   });
 
   const payload = strip(resp.choices?.[0]?.message?.content || '{}');
-
   try {
     const json = JSON.parse(payload);
     return {
@@ -67,11 +71,10 @@ export async function normalizeLocation(rawText) {
       needsCity: Boolean(json.needsCity),
       needsCountry: Boolean(json.needsCountry),
       normalized:
-        json.normalized ??
-        (json.city && json.country ? `${json.city}, ${json.country}` : null),
+        json.normalized ?? (json.city && json.country ? `${json.city}, ${json.country}` : null),
       note: json.note ?? null
     };
-  } catch (error) {
+  } catch {
     return {
       city: null,
       country: null,
@@ -137,7 +140,7 @@ export async function validateGeo(city, country) {
       countryCanonical: json.countryCanonical ?? country ?? null,
       note: json.note ?? null
     };
-  } catch (error) {
+  } catch {
     return {
       isCityValid: false,
       isCountryValid: false,
@@ -147,4 +150,107 @@ export async function validateGeo(city, country) {
       note: 'parse_error'
     };
   }
+}
+
+const COMMON_CITY_TO_COUNTRY = {
+  amsterdam: 'Netherlands',
+  rotterdam: 'Netherlands',
+  paris: 'France',
+  lyon: 'France',
+  berlin: 'Germany',
+  munich: 'Germany',
+  'münchen': 'Germany',
+  barcelona: 'Spain',
+  madrid: 'Spain',
+  lisbon: 'Portugal',
+  porto: 'Portugal',
+  rome: 'Italy',
+  milano: 'Italy',
+  milan: 'Italy',
+  london: 'United Kingdom',
+  manchester: 'United Kingdom',
+  kyiv: 'Ukraine',
+  kiev: 'Ukraine',
+  warsaw: 'Poland',
+  krakow: 'Poland',
+  istanbul: 'Turkey',
+  'new york': 'United States',
+  'los angeles': 'United States',
+  'san francisco': 'United States'
+};
+
+async function guessCountryByCity(city) {
+  if (!city) return null;
+  const key = city.toLowerCase().trim();
+  if (COMMON_CITY_TO_COUNTRY[key]) return COMMON_CITY_TO_COUNTRY[key];
+
+  const cli = getClient();
+  if (!cli) return null;
+
+  const SYS = `Given a city name, answer ONLY the country's canonical English name, or "null" if unknown. Examples: "Amsterdam" -> "Netherlands", "Kiev" -> "Ukraine".`;
+  const resp = await cli.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    messages: [
+      { role: 'system', content: SYS },
+      { role: 'user', content: String(city) }
+    ]
+  });
+
+  const raw = (resp.choices?.[0]?.message?.content || '').trim();
+  if (/^null$/i.test(raw)) return null;
+  return raw.replace(/^"+|"+$/g, '');
+}
+
+export async function resolveLocationFreeform(text, hintCountry = null, hintCity = null) {
+  const parsed = await normalizeLocation(text);
+  let city = parsed.city || hintCity || null;
+  let country = parsed.country || hintCountry || null;
+
+  if (city && !country) {
+    const guessed = await guessCountryByCity(city);
+    if (guessed) country = guessed;
+  }
+
+  if (city && country) {
+    const validation = await validateGeo(city, country);
+    if (validation.isCityValid && validation.isCountryValid && validation.confidence >= 0.6) {
+      return {
+        status: 'ok',
+        city: validation.cityCanonical || city,
+        country: validation.countryCanonical || country
+      };
+    }
+    return {
+      status: 'ask_again',
+      message: 'Не уверен в локации. Укажи ещё раз в формате "Город, Страна". Например: "Porto, Portugal"'
+    };
+  }
+
+  if (!city && country) {
+    const validation = await validateGeo(null, country);
+    if (validation.isCountryValid || validation.confidence >= 0.6) {
+      return {
+        status: 'need_city',
+        country: validation.countryCanonical || country,
+        message: `Ок, страна "${validation.countryCanonical || country}". Какой город?`
+      };
+    }
+    return {
+      status: 'ask_again',
+      message: 'Страну не распознал. Укажи ещё раз, например: "Paris, France".'
+    };
+  }
+
+  if (city && !country) {
+    return {
+      status: 'ask_again',
+      message: `Город "${city}" понял, а страну не распознал. Напиши так: "Город, Страна".`
+    };
+  }
+
+  return {
+    status: 'ask_again',
+    message: 'Не понял локацию. Напиши в формате "Город, Страна".'
+  };
 }
