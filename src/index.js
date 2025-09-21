@@ -9,12 +9,13 @@ import {
   normalizeArt,
   normalizeCinema
 } from './normalize.js';
-import { normalizeLocation } from './location.js';
+import { normalizeLocation, validateGeo } from './location.js';
 import { parseDateRangeFlexible } from './dates.js';
 import { prisma, getOrCreateUser } from './db.js';
 import { getUI, setUI, resetUI, pushScreen, popScreen } from './state.js';
 import { friendlyReply } from './llm.js';
 import { recommendForUser } from './recs.js';
+import { funDescription } from './fun.js';
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -186,13 +187,20 @@ async function spinnerStop(ctx, userId) {
   setUI(userId, ui);
 }
 
-function editMenuKeyboard() {
+function feedOrEditKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🪄 Создать', 'feed:create')],
+    [Markup.button.callback('🛠 Изменить профиль', 'profile:edit')]
+  ]);
+}
+
+function profileEditKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('📍 Локация', 'edit:location')],
     [Markup.button.callback('🎧 Музыка', 'edit:music')],
     [Markup.button.callback('🍽️ Кухня', 'edit:cuisine')],
     [Markup.button.callback('🖼️ Живопись', 'edit:art')],
-    [Markup.button.callback('✖️ Отмена', 'edit:cancel')]
+    [Markup.button.callback('↩️ Назад', 'edit:back')]
   ]);
 }
 
@@ -201,7 +209,7 @@ function cancelKeyboard() {
 }
 
 async function showEditMenu(ctx, userId) {
-  const text = 'Твой профиль уже готов. Хочешь изменить его? Выбери раздел:';
+  const text = 'Что изменить?';
   const ui = getUI(userId);
   const menuIndex = [...ui.screens].reverse().findIndex((screen) => screen.type === 'menu');
 
@@ -210,7 +218,7 @@ async function showEditMenu(ctx, userId) {
     const existing = ui.screens[actualIndex];
     try {
       await ctx.telegram.editMessageText(ctx.chat.id, existing.messageId, undefined, text, {
-        reply_markup: editMenuKeyboard().reply_markup
+        reply_markup: profileEditKeyboard().reply_markup
       });
       return existing.messageId;
     } catch {
@@ -219,7 +227,7 @@ async function showEditMenu(ctx, userId) {
     }
   }
 
-  const message = await ctx.reply(text, editMenuKeyboard());
+  const message = await ctx.reply(text, profileEditKeyboard());
   pushScreen(userId, { type: 'menu', messageId: message.message_id });
   return message.message_id;
 }
@@ -244,18 +252,24 @@ bot.start(async (ctx) => {
 
   const existing = await prisma.user.findUnique({ where: { id: tgId } });
 
-  if (!existing) {
-    await prisma.user.create({
-      data: {
-        id: tgId,
-        step: 'dest',
-        username: ctx.from.username ?? null,
-        firstName: ctx.from.first_name ?? ctx.from.firstName ?? null,
-        lastName: ctx.from.last_name ?? ctx.from.lastName ?? null
-      }
-    });
-    await ctx.reply('Привет! Я помогу спланировать твои активности в поездке 👋');
-    await ask(ctx, tgId, 'Куда ты собираешься ехать? (город/локация)');
+  const hasProfile = existing && existing.city && existing.country && existing.dates;
+
+  if (!hasProfile) {
+    if (!existing) {
+      await prisma.user.create({
+        data: {
+          id: tgId,
+          step: 'dest',
+          username: ctx.from.username ?? null,
+          firstName: ctx.from.first_name ?? ctx.from.firstName ?? null,
+          lastName: ctx.from.last_name ?? ctx.from.lastName ?? null
+        }
+      });
+    } else {
+      await prisma.user.update({ where: { id: tgId }, data: { step: 'dest' } });
+    }
+    await ctx.reply('Привет! Давай настроим профиль для подбора событий 👋');
+    await ask(ctx, tgId, 'Куда ты собираешься ехать? (город, страна)');
     return;
   }
 
@@ -269,7 +283,10 @@ bot.start(async (ctx) => {
     }
   });
 
-  await showEditMenu(ctx, tgId);
+  const nickname = await funDescription(existing);
+  const text = `Твой профиль готов. Кстати, ты ${nickname}. Теперь можем сгенерировать тебе ленту локалити.`;
+  const message = await ctx.reply(text, feedOrEditKeyboard());
+  pushScreen(tgId, { type: 'menu_feed', messageId: message.message_id });
 });
 
 bot.command('reset', async (ctx) => {
@@ -295,7 +312,7 @@ bot.command('reset', async (ctx) => {
   });
   resetUI(userRecord.id);
   await ctx.reply('Сбросил прогресс. Давай заново.');
-  await ask(ctx, userRecord.id, 'Куда ты собираешься ехать? (город/локация)');
+  await ask(ctx, userRecord.id, 'Куда ты собираешься ехать? (город, страна)');
 });
 
 bot.command('where', async (ctx) => {
@@ -426,6 +443,69 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
+  const prev = popScreen(tgId);
+  if (prev?.messageId) {
+    try {
+      await ctx.telegram.deleteMessage(ctx.chat.id, prev.messageId);
+    } catch {}
+  }
+
+  if (data === 'feed:create') {
+    await spinnerStart(ctx, tgId);
+    try {
+      const { items } = await recommendForUser(tgId, 12);
+      if (!items.length) {
+        const msg = await ctx.reply('Пока ничего не нашёл. Хочешь обновить профиль?', profileEditKeyboard());
+        pushScreen(tgId, { type: 'menu_profile', messageId: msg.message_id });
+        return;
+      }
+
+      await ctx.reply('Вот свежая лента событий для тебя:');
+
+      for (const rec of items.slice(0, 12)) {
+        const when = rec.start ? rec.start.slice(0, 16).replace('T', ' ') : 'Дата уточняется';
+        const venue = [rec.venue?.name, rec.venue?.city, rec.venue?.country]
+          .filter(Boolean)
+          .join(', ');
+        const price = rec.priceFrom ? `от ${rec.priceFrom} ${rec.priceCurrency || ''}` : '';
+        const text = `• *${rec.title}* (${rec.category})\n${venue}\n${when}${price ? `\n${price}` : ''}`;
+        await ctx.reply(text, {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [
+              rec.url
+                ? Markup.button.url('Ссылка', rec.url)
+                : Markup.button.callback('Нет ссылки', 'noop')
+            ]
+          ])
+        });
+      }
+
+      const tail = await ctx.reply('Нужно что-то поправить в профиле?', profileEditKeyboard());
+      pushScreen(tgId, { type: 'menu_profile', messageId: tail.message_id });
+    } catch (error) {
+      console.error('feed:create error', error);
+      const msg = await ctx.reply('Не смог собрать подборку. Попробуй позже.', feedOrEditKeyboard());
+      pushScreen(tgId, { type: 'menu_feed', messageId: msg.message_id });
+    } finally {
+      await spinnerStop(ctx, tgId);
+    }
+    return;
+  }
+
+  if (data === 'profile:edit') {
+    const msg = await ctx.reply('Выбери, что изменить:', profileEditKeyboard());
+    pushScreen(tgId, { type: 'menu_profile', messageId: msg.message_id });
+    return;
+  }
+
+  if (data === 'edit:back') {
+    const msg = await ctx.reply('Выбирай: создать ленту или изменить профиль.', feedOrEditKeyboard());
+    pushScreen(tgId, { type: 'menu_feed', messageId: msg.message_id });
+    await prisma.user.update({ where: { id: tgId }, data: { step: 'done' } });
+    return;
+  }
+
   if (data === 'edit:location') {
     await prisma.user.update({ where: { id: tgId }, data: { step: 'edit_location' } });
     const message = await ctx.reply('Введи новую локацию (город или город, страна):', cancelKeyboard());
@@ -451,29 +531,6 @@ bot.on('callback_query', async (ctx) => {
     await prisma.user.update({ where: { id: tgId }, data: { step: 'edit_art' } });
     const message = await ctx.reply('Обнови предпочтения в искусстве (направления/авторы):', cancelKeyboard());
     pushScreen(tgId, { type: 'edit_art', messageId: message.message_id });
-    return;
-  }
-
-  if (data === 'edit:cancel') {
-    const scr = popScreen(tgId);
-    if (scr?.messageId) {
-      try {
-        await ctx.telegram.deleteMessage(ctx.chat.id, scr.messageId);
-      } catch {}
-    }
-    await prisma.user.update({ where: { id: tgId }, data: { step: 'done' } });
-    return;
-  }
-
-  if (data === 'edit:back') {
-    const scr = popScreen(tgId);
-    if (scr?.messageId) {
-      try {
-        await ctx.telegram.deleteMessage(ctx.chat.id, scr.messageId);
-      } catch {}
-    }
-    await prisma.user.update({ where: { id: tgId }, data: { step: 'done' } });
-    await showEditMenu(ctx, tgId);
     return;
   }
 });
@@ -535,11 +592,24 @@ bot.on('text', async (ctx) => {
 
     const city = loc.city || null;
     const country = loc.country || null;
-    const destination = city && country ? `${city}, ${country}` : loc.normalized || text;
+    const validation = await validateGeo(city, country);
+    if (!(validation.isCityValid && validation.isCountryValid) || validation.confidence < 0.6) {
+      await prisma.user.update({ where: { id: userRecord.id }, data: { step: 'edit_location' } });
+      const retry = await ctx.reply(
+        'Не уверен в локации. Можешь уточнить город и страну ещё раз? Например: "Porto, Portugal"',
+        cancelKeyboard()
+      );
+      pushScreen(userRecord.id, { type: 'edit_location', messageId: retry.message_id });
+      return;
+    }
+
+    const finalCity = validation.cityCanonical || city;
+    const finalCountry = validation.countryCanonical || country;
+    const destination = [finalCity, finalCountry].filter(Boolean).join(', ') || loc.normalized || text;
 
     await prisma.user.update({
       where: { id: userRecord.id },
-      data: { city, country, destination, step: 'done' }
+      data: { city: finalCity, country: finalCountry, destination, step: 'done' }
     });
 
     await ctx.reply(`Локация обновлена: ${destination}.`);
@@ -686,11 +756,24 @@ bot.on('text', async (ctx) => {
 
     const city = loc.city || null;
     const country = loc.country || null;
-    const destination = city && country ? `${city}, ${country}` : loc.normalized || text;
+
+    const validation = await validateGeo(city, country);
+    if (!(validation.isCityValid && validation.isCountryValid) || validation.confidence < 0.6) {
+      await ask(
+        ctx,
+        userRecord.id,
+        'Не уверен в локации. Можешь уточнить город и страну ещё раз? Например: "Porto, Portugal"'
+      );
+      return;
+    }
+
+    const finalCity = validation.cityCanonical || city;
+    const finalCountry = validation.countryCanonical || country;
+    const destination = [finalCity, finalCountry].filter(Boolean).join(', ') || loc.normalized || text;
 
     await prisma.user.update({
       where: { id: userRecord.id },
-      data: { city, country, destination, step: 'dates' }
+      data: { city: finalCity, country: finalCountry, destination, step: 'dates' }
     });
 
     const note = loc.normalized ? `Принял: ${loc.normalized}.` : `Принял: ${destination}.`;
@@ -721,11 +804,25 @@ bot.on('text', async (ctx) => {
 
     const city = guess.city || text;
     const country = user.country || guess.country || null;
-    const destination = city && country ? `${city}, ${country}` : guess.normalized || text;
+
+    const validation = await validateGeo(city, country);
+    if (!(validation.isCityValid && validation.isCountryValid) || validation.confidence < 0.6) {
+      await prisma.user.update({ where: { id: userRecord.id }, data: { step: 'dest' } });
+      await ask(
+        ctx,
+        userRecord.id,
+        'Не уверен в локации. Можешь уточнить город и страну ещё раз? Например: "Porto, Portugal"'
+      );
+      return;
+    }
+
+    const finalCity = validation.cityCanonical || city;
+    const finalCountry = validation.countryCanonical || country;
+    const destination = [finalCity, finalCountry].filter(Boolean).join(', ') || guess.normalized || text;
 
     await prisma.user.update({
       where: { id: userRecord.id },
-      data: { city, country, destination, step: 'dates' }
+      data: { city: finalCity, country: finalCountry, destination, step: 'dates' }
     });
 
     await ask(ctx, userRecord.id, `Принял: ${destination}.\nТеперь даты?`);
@@ -751,11 +848,25 @@ bot.on('text', async (ctx) => {
 
     const city = user.city || guess.city || null;
     const country = guess.country || text;
-    const destination = city && country ? `${city}, ${country}` : guess.normalized || text;
+
+    const validation = await validateGeo(city, country);
+    if (!(validation.isCityValid && validation.isCountryValid) || validation.confidence < 0.6) {
+      await prisma.user.update({ where: { id: userRecord.id }, data: { step: 'dest' } });
+      await ask(
+        ctx,
+        userRecord.id,
+        'Не уверен в локации. Можешь уточнить город и страну ещё раз? Например: "Porto, Portugal"'
+      );
+      return;
+    }
+
+    const finalCity = validation.cityCanonical || city;
+    const finalCountry = validation.countryCanonical || country;
+    const destination = [finalCity, finalCountry].filter(Boolean).join(', ') || guess.normalized || text;
 
     await prisma.user.update({
       where: { id: userRecord.id },
-      data: { city, country, destination, step: 'dates' }
+      data: { city: finalCity, country: finalCountry, destination, step: 'dates' }
     });
 
     await ask(ctx, userRecord.id, `Принял: ${destination}.\nТеперь даты?`);

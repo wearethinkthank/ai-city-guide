@@ -83,3 +83,68 @@ export async function normalizeLocation(rawText) {
     };
   }
 }
+
+const VALIDATOR_SYS = `
+You validate if a given City and Country exist in the real world.
+Return STRICT JSON:
+{
+  "isCityValid": boolean,
+  "isCountryValid": boolean,
+  "confidence": number,
+  "cityCanonical": string|null,
+  "countryCanonical": string|null,
+  "note": string|null
+}
+Rules:
+- If you detect a typo and can fix confidently, set valid=true and provide canonical names.
+- If ambiguous or unknown, set valid=false and confidence low.
+- Answer ONLY JSON.
+`;
+
+export async function validateGeo(city, country) {
+  const cli = getClient();
+  if (!cli) {
+    const okCity = !!(city && city.length >= 2);
+    const okCountry = !!(country && country.length >= 2);
+    return {
+      isCityValid: okCity,
+      isCountryValid: okCountry,
+      confidence: okCity && okCountry ? 0.6 : 0.3,
+      cityCanonical: city || null,
+      countryCanonical: country || null,
+      note: 'fallback_no_llm'
+    };
+  }
+
+  const payload = { city: city || null, country: country || null };
+  const resp = await cli.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    messages: [
+      { role: 'system', content: VALIDATOR_SYS },
+      { role: 'user', content: JSON.stringify(payload) }
+    ]
+  });
+
+  const txt = strip(resp.choices?.[0]?.message?.content || '{}');
+  try {
+    const json = JSON.parse(txt);
+    return {
+      isCityValid: !!json.isCityValid,
+      isCountryValid: !!json.isCountryValid,
+      confidence: typeof json.confidence === 'number' ? json.confidence : 0.5,
+      cityCanonical: json.cityCanonical ?? city ?? null,
+      countryCanonical: json.countryCanonical ?? country ?? null,
+      note: json.note ?? null
+    };
+  } catch (error) {
+    return {
+      isCityValid: false,
+      isCountryValid: false,
+      confidence: 0,
+      cityCanonical: city || null,
+      countryCanonical: country || null,
+      note: 'parse_error'
+    };
+  }
+}
