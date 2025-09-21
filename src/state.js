@@ -1,13 +1,14 @@
 // UI-состояние: id последнего вопроса + стек "экранов" (для возврата по Отмена)
-const uiMemory = new Map(); // userId -> { lastPromptId?: number, screens?: Array<{type:string, messageId:number}>, spinner?: { msgId?: number, timer?: NodeJS.Timer } }
+const uiMemory = new Map(); // userId -> { lastPromptId?: number, screens?: Array<{type:string, messageId:number}>, spinner?: { msgId?: number, timer?: NodeJS.Timer }, recs?: { items?: any[], index?: number, msgId?: number } }
 
 export function getUI(userId) {
   if (!uiMemory.has(userId)) {
-    uiMemory.set(userId, { lastPromptId: undefined, screens: [], spinner: {} });
+    uiMemory.set(userId, { lastPromptId: undefined, screens: [], spinner: {}, recs: {} });
   }
   const ui = uiMemory.get(userId);
   if (!ui.screens) ui.screens = [];
   if (!ui.spinner) ui.spinner = {};
+  if (!ui.recs) ui.recs = {};
   if (typeof ui.lastPromptId === 'undefined') ui.lastPromptId = undefined;
   return ui;
 }
@@ -15,6 +16,7 @@ export function getUI(userId) {
 export function setUI(userId, ui) {
   if (!ui.screens) ui.screens = [];
   if (!ui.spinner) ui.spinner = {};
+  if (!ui.recs) ui.recs = {};
   if (typeof ui.lastPromptId === 'undefined') ui.lastPromptId = undefined;
   uiMemory.set(userId, ui);
 }
@@ -22,7 +24,7 @@ export function setUI(userId, ui) {
 export function resetUI(userId) {
   const ui = getUI(userId);
   if (ui.spinner?.timer) clearInterval(ui.spinner.timer);
-  uiMemory.set(userId, { lastPromptId: undefined, screens: [], spinner: {} });
+  uiMemory.set(userId, { lastPromptId: undefined, screens: [], spinner: {}, recs: {} });
 }
 
 export function pushScreen(userId, screen) {

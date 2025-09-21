@@ -204,6 +204,62 @@ function profileEditKeyboard() {
   ]);
 }
 
+function recText(rec) {
+  const when = rec.start ? rec.start.slice(0, 16).replace('T', ' ') : 'Дата уточняется';
+  const venue = [rec.venue?.name, rec.venue?.city].filter(Boolean).join(', ');
+  const price = rec.priceFrom ? `от ${rec.priceFrom} ${rec.priceCurrency || ''}` : '';
+  return `*${rec.title}* (${rec.category})\n${venue}\n${when}${price ? `\n${price}` : ''}`.trim();
+}
+
+function recKeyboard(rec) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('⬅️', 'recs:prev'),
+      rec.url ? Markup.button.url('ссылка', rec.url) : Markup.button.callback('ссылка', 'noop'),
+      Markup.button.callback('➡️', 'recs:next')
+    ],
+    [Markup.button.callback('🛠 изменить профиль', 'profile:edit')]
+  ]);
+}
+
+async function setUserRecs(userId, items) {
+  const ui = getUI(userId);
+  ui.recs = { items, index: 0, msgId: ui.recs?.msgId || undefined };
+  setUI(userId, ui);
+}
+
+function getUserRecs(userId) {
+  const ui = getUI(userId);
+  return ui.recs || { items: [], index: 0, msgId: undefined };
+}
+
+async function showRecAt(ctx, userId, index) {
+  const ui = getUI(userId);
+  const arr = ui.recs?.items || [];
+  if (!arr.length) return;
+  const normalizedIndex = ((index % arr.length) + arr.length) % arr.length;
+  ui.recs.index = normalizedIndex;
+  setUI(userId, ui);
+
+  const rec = arr[normalizedIndex];
+  const text = recText(rec);
+  const keyboard = recKeyboard(rec);
+
+  if (ui.recs.msgId) {
+    try {
+      await ctx.telegram.editMessageText(ctx.chat.id, ui.recs.msgId, undefined, text, {
+        parse_mode: 'Markdown',
+        ...keyboard
+      });
+      return;
+    } catch {}
+  }
+
+  const message = await ctx.reply(text, { parse_mode: 'Markdown', ...keyboard });
+  ui.recs.msgId = message.message_id;
+  setUI(userId, ui);
+}
+
 function cancelKeyboard() {
   return Markup.inlineKeyboard([[Markup.button.callback('↩️ Отмена', 'edit:back')]]);
 }
@@ -395,33 +451,21 @@ bot.command('recs', async (ctx) => {
   const userId = String(ctx.from.id);
   await spinnerStart(ctx, userId);
   try {
-    const { items, meta } = await recommendForUser(userId, 5);
+    const { items } = await recommendForUser(userId, 50);
     if (!items.length) {
-      await ctx.reply('Пока ничего подходящего не нашёл. Попробуй уточнить вкусы или даты.');
+      await ctx.reply('Пока ничего подходящего не нашёл. Попробуй уточнить профиль.');
       return;
     }
-    const headline = `Подборка для ${[meta.city, meta.country].filter(Boolean).join(', ') || 'твоей поездки'} ${
-      meta.start ? `с ${meta.start.slice(0, 10)}` : ''
-    } ${meta.end ? `по ${meta.end.slice(0, 10)}` : ''}`.replace(/\s+/g, ' ').trim();
-    await ctx.reply(headline);
-    for (const rec of items) {
-      const when = rec.start ? rec.start.slice(0, 16).replace('T', ' ') : 'Дата уточняется';
-      const venueLine = [rec.venue?.name, rec.venue?.city, rec.venue?.country]
-        .filter(Boolean)
-        .join(', ');
-      const priceLine = rec.priceFrom ? `от ${rec.priceFrom} ${rec.priceCurrency || ''}` : '';
-      const text = `• *${rec.title}* (${rec.category})\n${venueLine}\n${when}${priceLine ? `\n${priceLine}` : ''}`;
-      await ctx.reply(text, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [
-            rec.url
-              ? Markup.button.url('Ссылка', rec.url)
-              : Markup.button.callback('Нет ссылки', 'noop')
-          ]
-        ])
-      });
+
+    const scr = popScreen(userId);
+    if (scr?.messageId) {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, scr.messageId);
+      } catch {}
     }
+
+    await setUserRecs(userId, items);
+    await showRecAt(ctx, userId, 0);
   } catch (error) {
     console.error('/recs command error', error);
     await ctx.reply('Не получилось собрать подборку. Попробуй позже.');
@@ -443,6 +487,13 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
+  if (data === 'recs:next' || data === 'recs:prev') {
+    const { index } = getUserRecs(tgId);
+    const delta = data === 'recs:next' ? 1 : -1;
+    await showRecAt(ctx, tgId, index + delta);
+    return;
+  }
+
   const prev = popScreen(tgId);
   if (prev?.messageId) {
     try {
@@ -453,36 +504,15 @@ bot.on('callback_query', async (ctx) => {
   if (data === 'feed:create') {
     await spinnerStart(ctx, tgId);
     try {
-      const { items } = await recommendForUser(tgId, 12);
+      const { items } = await recommendForUser(tgId, 50);
       if (!items.length) {
-        const msg = await ctx.reply('Пока ничего не нашёл. Хочешь обновить профиль?', profileEditKeyboard());
-        pushScreen(tgId, { type: 'menu_profile', messageId: msg.message_id });
+        const msg = await ctx.reply('Пока ничего не нашёл. Хочешь обновить профиль?', feedOrEditKeyboard());
+        pushScreen(tgId, { type: 'menu_feed', messageId: msg.message_id });
         return;
       }
 
-      await ctx.reply('Вот свежая лента событий для тебя:');
-
-      for (const rec of items.slice(0, 12)) {
-        const when = rec.start ? rec.start.slice(0, 16).replace('T', ' ') : 'Дата уточняется';
-        const venue = [rec.venue?.name, rec.venue?.city, rec.venue?.country]
-          .filter(Boolean)
-          .join(', ');
-        const price = rec.priceFrom ? `от ${rec.priceFrom} ${rec.priceCurrency || ''}` : '';
-        const text = `• *${rec.title}* (${rec.category})\n${venue}\n${when}${price ? `\n${price}` : ''}`;
-        await ctx.reply(text, {
-          parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([
-            [
-              rec.url
-                ? Markup.button.url('Ссылка', rec.url)
-                : Markup.button.callback('Нет ссылки', 'noop')
-            ]
-          ])
-        });
-      }
-
-      const tail = await ctx.reply('Нужно что-то поправить в профиле?', profileEditKeyboard());
-      pushScreen(tgId, { type: 'menu_profile', messageId: tail.message_id });
+      await setUserRecs(tgId, items);
+      await showRecAt(ctx, tgId, 0);
     } catch (error) {
       console.error('feed:create error', error);
       const msg = await ctx.reply('Не смог собрать подборку. Попробуй позже.', feedOrEditKeyboard());
@@ -971,7 +1001,11 @@ bot.on('text', async (ctx) => {
         step: 'done'
       }
     });
-    await ctx.reply('Готово! Профиль сохранён. Набери /profile, чтобы посмотреть.');
+    const refreshed = await prisma.user.findUnique({ where: { id: userRecord.id } });
+    const nick = await funDescription(refreshed || {});
+    const msg = `Твой профиль готов. Кстати, ты ${nick}. Теперь можем сгенерировать тебе ленту локалити.`;
+    const menuMsg = await ctx.reply(msg, feedOrEditKeyboard());
+    pushScreen(userRecord.id, { type: 'menu_feed', messageId: menuMsg.message_id });
     return;
   }
 
