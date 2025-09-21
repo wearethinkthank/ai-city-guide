@@ -205,10 +205,10 @@ function profileEditKeyboard() {
 }
 
 function recText(rec) {
-  const when = rec.start ? rec.start.slice(0, 16).replace('T', ' ') : 'Дата уточняется';
+  const when = rec.start ? rec.start.slice(0, 16).replace('T', ' ') : '';
   const venue = [rec.venue?.name, rec.venue?.city].filter(Boolean).join(', ');
   const price = rec.priceFrom ? `от ${rec.priceFrom} ${rec.priceCurrency || ''}` : '';
-  return `*${rec.title}* (${rec.category})\n${venue}\n${when}${price ? `\n${price}` : ''}`.trim();
+  return `*${rec.title}* (${rec.category})\n${venue}\n${when}\n${price}`.trim();
 }
 
 function recKeyboard(rec) {
@@ -218,19 +218,48 @@ function recKeyboard(rec) {
       rec.url ? Markup.button.url('ссылка', rec.url) : Markup.button.callback('ссылка', 'noop'),
       Markup.button.callback('➡️', 'recs:next')
     ],
-    [Markup.button.callback('🛠 изменить профиль', 'profile:edit')]
+    [
+      Markup.button.callback('🛠 изменить профиль', 'profile:edit'),
+      Markup.button.callback('🖼 обложка', 'recs:img')
+    ]
   ]);
 }
 
 async function setUserRecs(userId, items) {
   const ui = getUI(userId);
-  ui.recs = { items, index: 0, msgId: ui.recs?.msgId || undefined };
+  ui.recs = {
+    items,
+    index: 0,
+    msgId: ui.recs?.msgId || undefined,
+    imgIndex: {}
+  };
   setUI(userId, ui);
 }
 
 function getUserRecs(userId) {
   const ui = getUI(userId);
-  return ui.recs || { items: [], index: 0, msgId: undefined };
+  ui.recs ||= { items: [], index: 0, msgId: undefined, imgIndex: {} };
+  ui.recs.imgIndex ||= {};
+  setUI(userId, ui);
+  return ui.recs;
+}
+
+function currentImageFor(ui, idx) {
+  const arr = ui.recs?.items || [];
+  const rec = arr[idx];
+  if (!rec || !Array.isArray(rec.images) || rec.images.length === 0) return null;
+  const imgIdx = ui.recs.imgIndex?.[idx] || 0;
+  return rec.images[imgIdx % rec.images.length];
+}
+
+function bumpImageIndex(userId, idx) {
+  const ui = getUI(userId);
+  const arr = ui.recs?.items || [];
+  const rec = arr[idx];
+  if (!rec || !Array.isArray(rec.images) || rec.images.length === 0) return;
+  const next = ((ui.recs.imgIndex?.[idx] || 0) + 1) % rec.images.length;
+  ui.recs.imgIndex[idx] = next;
+  setUI(userId, ui);
 }
 
 async function showRecAt(ctx, userId, index) {
@@ -244,18 +273,57 @@ async function showRecAt(ctx, userId, index) {
   const rec = arr[normalizedIndex];
   const text = recText(rec);
   const keyboard = recKeyboard(rec);
+  const image = currentImageFor(ui, normalizedIndex);
+  const replyMarkup = keyboard.reply_markup ?? keyboard;
+
+  if (!image) {
+    if (ui.recs.msgId) {
+      try {
+        await ctx.telegram.editMessageText(ctx.chat.id, ui.recs.msgId, undefined, text, {
+          parse_mode: 'Markdown',
+          reply_markup: replyMarkup
+        });
+        return;
+      } catch {
+        try {
+          await ctx.telegram.deleteMessage(ctx.chat.id, ui.recs.msgId);
+        } catch {}
+      }
+    }
+    const message = await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      reply_markup: replyMarkup
+    });
+    ui.recs.msgId = message.message_id;
+    setUI(userId, ui);
+    return;
+  }
+
+  const media = {
+    type: 'photo',
+    media: image,
+    caption: text,
+    parse_mode: 'Markdown'
+  };
 
   if (ui.recs.msgId) {
     try {
-      await ctx.telegram.editMessageText(ctx.chat.id, ui.recs.msgId, undefined, text, {
-        parse_mode: 'Markdown',
-        ...keyboard
+      await ctx.telegram.editMessageMedia(ctx.chat.id, ui.recs.msgId, undefined, media, {
+        reply_markup: replyMarkup
       });
       return;
-    } catch {}
+    } catch {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, ui.recs.msgId);
+      } catch {}
+    }
   }
 
-  const message = await ctx.reply(text, { parse_mode: 'Markdown', ...keyboard });
+  const message = await ctx.replyWithPhoto(image, {
+    caption: text,
+    parse_mode: 'Markdown',
+    reply_markup: replyMarkup
+  });
   ui.recs.msgId = message.message_id;
   setUI(userId, ui);
 }
@@ -491,6 +559,13 @@ bot.on('callback_query', async (ctx) => {
     const { index } = getUserRecs(tgId);
     const delta = data === 'recs:next' ? 1 : -1;
     await showRecAt(ctx, tgId, index + delta);
+    return;
+  }
+
+  if (data === 'recs:img') {
+    const { index } = getUserRecs(tgId);
+    bumpImageIndex(tgId, index);
+    await showRecAt(ctx, tgId, index);
     return;
   }
 

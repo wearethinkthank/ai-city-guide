@@ -6,17 +6,19 @@ export function getUI(userId) {
     uiMemory.set(userId, { lastPromptId: undefined, screens: [], spinner: {}, recs: {} });
   }
   const ui = uiMemory.get(userId);
-  if (!ui.screens) ui.screens = [];
-  if (!ui.spinner) ui.spinner = {};
-  if (!ui.recs) ui.recs = {};
+  ui.screens ||= [];
+  ui.spinner ||= {};
+  ui.recs ||= { items: [], index: 0, msgId: undefined, imgIndex: {} };
+  ui.recs.imgIndex ||= {};
   if (typeof ui.lastPromptId === 'undefined') ui.lastPromptId = undefined;
   return ui;
 }
 
 export function setUI(userId, ui) {
-  if (!ui.screens) ui.screens = [];
-  if (!ui.spinner) ui.spinner = {};
-  if (!ui.recs) ui.recs = {};
+  ui.screens ||= [];
+  ui.spinner ||= {};
+  ui.recs ||= { items: [], index: 0, msgId: undefined, imgIndex: {} };
+  ui.recs.imgIndex ||= {};
   if (typeof ui.lastPromptId === 'undefined') ui.lastPromptId = undefined;
   uiMemory.set(userId, ui);
 }

@@ -21,6 +21,7 @@ export const RecCategory = {
  *   priceCurrency: string|null,
  *   tags: string[],
  *   url: string,
- *   confidence: number
+ *   confidence: number,
+ *   images?: string[]
  * }
  */
